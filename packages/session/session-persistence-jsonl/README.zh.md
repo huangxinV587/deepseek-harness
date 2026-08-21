@@ -74,5 +74,4 @@ JSONL 存储不修改实时请求前缀。只有重建历史、当前 envelope �
 - **压缩文件不能直接按行读取**：使用后端加载；或在写入新根前选择 `compression: 'none'`，以便外部行 reader 使用。
 - **不删除会话文件**：日志在 `root` 下累积，直到外部移除（seam 无删除接口）。
 - **每会话一个活动 writer**：append 和修复只在所属后端实例内协调。在所有者完成完全停稳的 dispose 前，其他后端实例或进程不得写入同一会话；初始同 id 发布仍通过 POSIX 无覆盖硬链接或 Windows 无替换 write-through rename 保持冲突安全。
-- **过期 append 会被拒绝而不是污染日志**：如果其他后端实例或进程推进了同一会话文件，下一次 append 会按持久化事件计数重新校验，拒绝重发已提交的 seq。在外部写入方留下的 torn 尾之后追加同样会被拒绝，直到一次 load 提交修复。已提交区域内出现重复或缺失（seq gap）的日志加载时报告 `seq gap in committed region` 诊断，而不是误导性的 torn-record 措辞。
 - **POSIX 实体化需要硬链接支持**：第一次 append 使用 `link()`，使同 id 竞态失败，而不覆盖已提交日志；Windows 使用无替换 write-through rename。
