@@ -335,15 +335,6 @@ export class SessionLogScanner {
   }
 
   /**
-   * The first latched scan defect, or `undefined` when every consumed line was
-   * a valid contiguous record. A latched defect freezes `committedBytes` even
-   * though the byte stream remains structurally complete.
-   */
-  get firstIssue(): Error | undefined {
-    return this.issue
-  }
-
-  /**
    * Finish scanning, ignoring a final record without a newline as a torn tail.
    * @returns the header, contiguous event prefix, and safe truncation offset.
    */
