@@ -96,7 +96,7 @@ interface FileRevisionIdentity {
   readonly ctimeNs: bigint
 }
 
-/** Build the source-qualified revision shared by full and lightweight reads. */
+/** Serialize a file identity into the revision string both full and lightweight reads use to detect file changes. */
 function fileRevision(identity: FileRevisionIdentity): PersistenceRevision {
   return SessionPersistenceRevision([
     identity.dev,
@@ -144,6 +144,15 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   private compression: JsonlCompression
   private coordinator: PersistenceCoordinator<JsonlTornMarker>
   private rootEncodingCheck: Promise<void> | undefined
+
+  /**
+   * File identity of each session after this backend last wrote it. When a stat
+   * before an append differs from this identity, another backend instance or
+   * process advanced the same log, so the batch is re-validated against the
+   * durable event count before any bytes are written (see
+   * {@link assertDurableContinuation}).
+   */
+  private readonly durableIdentity = new Map<SessionId, FileRevisionIdentity>()
 
   constructor(ctx: Context, public config: Config) {
     super(ctx)
@@ -380,7 +389,11 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
       signal?.throwIfAborted()
       const complete = scanner.checkpoint()
       if (complete.committedBytes !== complete.inputBytes) {
-        throw new Error('corrupt Zstandard session log: complete frame contains a torn JSONL record')
+        // A byte-complete frame can still be logically broken: a duplicate or
+        // missing seq, or an unparsable committed row, stops committedBytes
+        // from advancing. Report that specific diagnosis instead of the
+        // generic byte-level torn-record wording.
+        throw scanner.firstIssue ?? new Error('corrupt Zstandard session log: complete frame contains a torn JSONL record')
       }
       if (tornStart === undefined) {
         const prefix = scanner.finish()
@@ -523,6 +536,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     } else {
       await this.materializePosix(project, dir, finalPath, meta.id, content)
     }
+    this.durableIdentity.set(meta.id, await stat(finalPath, { bigint: true }))
   }
 
   /* v8 ignore start -- Windows uses the Win32 durable-publish path; POSIX coverage exercises this peer. */
@@ -660,22 +674,66 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     }
 
     try {
-      const { size: before } = await handle.stat()
+      const before = await handle.stat({ bigint: true })
+      const known = this.durableIdentity.get(meta.id)
+      // The file changed since this backend last wrote it (dev/ino/size/mtimeNs/
+      // ctimeNs): another backend instance or process advanced the log, so
+      // re-validate the batch before writing.
+      if (known !== undefined && fileRevision(known) !== fileRevision(before)) {
+        await this.assertDurableContinuation(meta, events)
+      }
       try {
         await handle.writeFile(content)
         await handle.sync()
       } catch (error) {
         try {
           await closeAppendHandle()
-          await this.rollbackAppend(path, before)
+          await this.rollbackAppend(path, Number(before.size))
         } catch (rollbackError) {
           throw new AggregateError([error, rollbackError], `failed to roll back append to "${path}"`)
         }
         throw error
       }
+      this.durableIdentity.set(meta.id, await handle.stat({ bigint: true }))
     } finally {
       await closeAppendHandle()
     }
+  }
+
+  /**
+   * Guard a stale append from re-emitting already-committed seqs. When the file
+   * changed since this backend's last write, another backend instance or
+   * process advanced the session (for example a crash-repair closer sequence
+   * committed by a concurrent load). Re-read the stored prefix and refuse a
+   * batch whose first seq falls below the durable event count: a duplicate seq
+   * breaks the log's global continuity and makes the whole artifact unloadable.
+   */
+  private async assertDurableContinuation(meta: SessionHeader, events: readonly SessionEvent[]): Promise<void> {
+    const stored = await this.loadStored(meta.id)
+    /* v8 ignore next 3 -- appends are serialized within one backend instance; the re-read cannot race a disappearance */
+    if (stored === undefined) {
+      throw new Error(`refusing to append session "${meta.id}": the durable log disappeared while another writer advanced it`)
+    }
+    // The durable log ends in a torn tail: a writer crashed mid-batch. A frame
+    // appended after the torn bytes would later be silently discarded by the
+    // reader's torn-tail recovery, so refuse until a load commits the repair.
+    if (stored.tornMarker !== undefined) {
+      throw new Error(
+        `refusing to append session "${meta.id}": the durable log ends in a torn tail; `
+        + 'close and reopen the session so a load commits the repair, then append',
+      )
+    }
+    const leadingSeq = events[0]?.seq
+    /* v8 ignore next 3 -- appendCore never sends an empty batch; refuse the boundary violation loudly instead of a silent no-op */
+    if (leadingSeq === undefined) {
+      throw new Error(`refusing to append an empty batch to session "${meta.id}"`)
+    }
+    if (leadingSeq >= stored.events.length) return
+    throw new Error(
+      `refusing to append session "${meta.id}" from seq ${leadingSeq}: the durable log already contains `
+      + `${stored.events.length} events advanced by another backend instance, process, or recovery repair; `
+      + `close and reopen the session so appends continue from seq ${stored.events.length}`,
+    )
   }
 
   private async rollbackAppend(path: string, size: number): Promise<void> {

@@ -335,6 +335,15 @@ export class SessionLogScanner {
   }
 
   /**
+   * The first problem the scan recorded, or `undefined` while every consumed
+   * line was valid. Once recorded, the problem keeps `committedBytes` from
+   * advancing even though the byte stream is still structurally complete.
+   */
+  get firstIssue(): Error | undefined {
+    return this.issue
+  }
+
+  /**
    * Finish scanning, ignoring a final record without a newline as a torn tail.
    * @returns the header, contiguous event prefix, and safe truncation offset.
    */
