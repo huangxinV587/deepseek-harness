@@ -693,6 +693,146 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
       .rejects.toThrow(/first frame is not exactly one header line/)
     await expect(ctx.sessionPersistence.list()).rejects.toThrow(/header frame failed validation/)
   })
+
+  it('refuses an append whose seqs overlap rows a second backend instance committed', async () => {
+    const root = await freshRoot()
+    const writer = await mount(root)
+    const header = meta('two-writer-seq-overlap')
+    await writer.sessionPersistence.create(header)
+    // An open turn: no step/end or turn/end, so a second instance's load
+    // crash-repairs it with synthetic interrupted closers.
+    const openTurn: SessionEvent[] = [
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+      { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
+      {
+        type: 'assistant/chunk', seq: 2, time: 3,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'a' } },
+      },
+      {
+        type: 'assistant/chunk', seq: 3, time: 4,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'b' } },
+      },
+    ]
+    await writer.sessionPersistence.append(header.id, openTurn)
+
+    // A separate backend instance over the same shared log loads the open turn
+    // and durably commits the interrupted closers (seq 4, 5).
+    const repairer = await mount(root)
+    const repaired = await repairer.sessionPersistence.load(header.id)
+    expect(repaired.events.map(e => e.seq)).toEqual([0, 1, 2, 3, 4, 5])
+
+    // The first instance restarts from its stale in-memory counter: the batch
+    // would re-emit already-committed seqs, so the append must be refused.
+    const stale: SessionEvent[] = [
+      {
+        type: 'assistant/chunk', seq: 4, time: 5,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'c' } },
+      },
+    ]
+    await expect(writer.sessionPersistence.append(header.id, stale)).rejects.toThrow(/refusing to append/)
+
+    // The shared log is untouched: a fresh mount reads exactly the repaired log.
+    const verifier = await mount(root)
+    expect((await verifier.sessionPersistence.load(header.id)).events.map(e => e.seq))
+      .toEqual([0, 1, 2, 3, 4, 5])
+  })
+
+  it('surfaces the latched seq-gap defect instead of the generic torn-JSONL message', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('duplicate-seq-tail')
+    await ctx.sessionPersistence.create(header)
+    await ctx.sessionPersistence.append(header.id, oneTurnLog())
+    await ctx.sessionPersistence.append(header.id, [
+      { type: 'step/end', seq: 6, time: 7, data: { turn: 1, step: 1 } },
+      { type: 'turn/end', seq: 7, time: 8, data: { turn: 1, reason: { kind: 'interrupted' } } },
+    ] as SessionEvent[])
+
+    // A complete frame whose rows re-emit already-committed seqs: structurally
+    // valid bytes, logically corrupted — the field-report artifact shape.
+    const duplicated = [
+      {
+        type: 'assistant/chunk', seq: 6, time: 9,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x' } },
+      },
+      {
+        type: 'assistant/chunk', seq: 7, time: 10,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'y' } },
+      },
+    ].map(e => JSON.stringify(e)).join('\n') + '\n'
+    await appendFile(
+      logPath(root, header.cwd, header.id, 'zstd'),
+      await compressZstdFrame(duplicated),
+    )
+
+    await expect(ctx.sessionPersistence.load(header.id)).rejects.toThrow(/seq gap in committed region/)
+  })
+
+  it('continues appending when a foreign log ends exactly where the batch begins', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('foreign-equality')
+    await ctx.sessionPersistence.create(header)
+    const prefix: SessionEvent[] = [
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+      { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
+    ]
+    await ctx.sessionPersistence.append(header.id, prefix)
+
+    // A foreign writer closes the turn (seq 2, 3) directly in the log, ending
+    // exactly where the next batch begins — the append continues, not refuses.
+    const foreignTail = [
+      { type: 'step/end', seq: 2, time: 3, data: { turn: 1, step: 1 } },
+      { type: 'turn/end', seq: 3, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+    ].map(e => JSON.stringify(e)).join('\n') + '\n'
+    await appendFile(logPath(root, header.cwd, header.id, 'zstd'), await compressZstdFrame(foreignTail))
+
+    const backend = ctx.sessionPersistence as JsonlSessionPersistence
+    const continued: SessionEvent[] = [
+      { type: 'turn/start', seq: 4, time: 5, data: { turn: 2 } },
+      { type: 'turn/end', seq: 5, time: 6, data: { turn: 2, reason: { kind: 'completed' } } },
+    ]
+    await backend.appendBatch(header, continued, true)
+    expect((await ctx.sessionPersistence.load(header.id)).events.map(e => e.seq)).toEqual([0, 1, 2, 3, 4, 5])
+  })
+
+  it('refuses an append past a torn tail left by a foreign writer', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('foreign-torn-tail')
+    await ctx.sessionPersistence.create(header)
+    await ctx.sessionPersistence.append(header.id, [
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+    ])
+
+    // A foreign writer crashed mid-batch: the log ends in an incomplete frame.
+    const tornFrame = await compressZstdFrame(JSON.stringify({
+      type: 'assistant/chunk', seq: 1, time: 2,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'a' } },
+    }) + '\n')
+    await appendFile(
+      logPath(root, header.cwd, header.id, 'zstd'),
+      tornFrame.subarray(0, Math.floor(tornFrame.length * 0.6)),
+    )
+
+    // An append that would continue after the torn bytes is refused: the
+    // reader's torn-tail recovery would silently discard the new batch.
+    const stale: SessionEvent[] = [
+      {
+        type: 'assistant/chunk', seq: 1, time: 3,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'b' } },
+      },
+    ]
+    await expect(ctx.sessionPersistence.append(header.id, stale)).rejects.toThrow(/torn tail/)
+
+    // The file is untouched; a load commits the repair and closes the open turn.
+    const loaded = await ctx.sessionPersistence.load(header.id)
+    const seqs = loaded.events.map(e => e.seq)
+    expect(loaded.events[0]?.seq).toBe(0)
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
+    expect(loaded.events.at(-1)?.type).toBe('turn/end')
+    expect(loaded.events.at(-1)?.data).toMatchObject({ reason: { kind: 'interrupted' } })
+  })
 })
 
 describe('JsonlSessionPersistence: encoding selection', () => {
