@@ -1846,6 +1846,68 @@ describe('automatic listener and loader composition', () => {
     expect(session.surface.nodes).toContain(retainedSeq)
   })
 
+  it('bounds overflow summarization to an older prefix instead of replaying the oversized surface', async () => {
+    const ctx = createContext(10_000)
+    const compact = new TestCompactionEngine(ctx, { headroomTokens: 0, maxTokens: 8192 })
+    const session = conversation(8, 'archive context '.repeat(500))
+    const originalCharacters = session.deriveMessages()
+      .flatMap(message => message.content)
+      .reduce((total, block) => total + (block.type === 'text' ? block.text.length : 0), 0)
+    const newest = session.surface.nodes.at(-1)!
+
+    await expect(compactIfNeeded(compact, session, 'context-overflow')).resolves.not.toBeNull()
+
+    expect(compact.calls).toHaveLength(1)
+    expect(summarizedText(compact.calls[0]!.input).length).toBeLessThan(originalCharacters * 0.75)
+    expect(session.surface.nodes).toContain(newest)
+  })
+
+  it('can recover overflow when a protected system head dominates the surface', async () => {
+    const ctx = createContext(100_000)
+    const compact = new TestCompactionEngine(ctx, { maxTokens: 32 })
+    const session = conversation(4, 'older context '.repeat(100), 'fixed instructions '.repeat(5_000))
+    const system = session.surface.nodes[0]!
+    const newest = session.surface.nodes.at(-1)!
+
+    await expect(compactIfNeeded(compact, session, 'context-overflow')).resolves.not.toBeNull()
+
+    expect(compact.calls).toHaveLength(1)
+    expect(session.surface.nodes).toContain(system)
+    expect(session.surface.nodes).toContain(newest)
+  })
+
+  it('still summarizes an indivisible old message larger than half the surface', async () => {
+    const ctx = createContext(100_000)
+    const compact = new TestCompactionEngine(ctx, { maxTokens: 32 })
+    const session = oversizedToolResult(100, true)
+    const newest = session.surface.nodes.at(-1)!
+
+    await expect(compactIfNeeded(compact, session, 'context-overflow')).resolves.not.toBeNull()
+
+    expect(compact.calls).toHaveLength(1)
+    expect(summarizedText(compact.calls[0]!.input)).toContain('older history')
+    expect(session.surface.nodes).toContain(newest)
+  })
+
+  it('bounds a later overflow after an earlier checkpoint reordered surface seqs', async () => {
+    const ctx = createContext(100_000)
+    const compact = new TestCompactionEngine(ctx, { maxTokens: 32 })
+    const session = conversation(8, 'archive context '.repeat(500))
+    const nodes = [...session.surface.nodes]
+    await compact.compactRegion(nodes[0]!, nodes[1]!, agent(session, MODEL), SIGNAL)
+    expect(session.surface.nodes[0]!).toBeGreaterThan(session.surface.nodes[1]!)
+    compact.calls.length = 0
+    const originalCharacters = session.deriveMessages().flatMap(message => message.content)
+      .reduce((total, block) => total + (block.type === 'text' ? block.text.length : 0), 0)
+    const newest = session.surface.nodes.at(-1)!
+
+    await expect(compactIfNeeded(compact, session, 'context-overflow')).resolves.not.toBeNull()
+
+    expect(compact.calls).toHaveLength(1)
+    expect(summarizedText(compact.calls[0]!.input).length).toBeLessThan(originalCharacters * 0.75)
+    expect(session.surface.nodes).toContain(newest)
+  })
+
   it('authorizes overflow retry when pruning alone advances an indivisible surface', async () => {
     const ctx = createContext(10_000)
     void new ToolResultPruner(ctx, {

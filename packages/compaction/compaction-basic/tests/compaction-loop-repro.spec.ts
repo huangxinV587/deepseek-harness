@@ -407,6 +407,11 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
 
         expect(adapter.conversationRequests).toHaveLength(2)
         expect(adapter.summaryRequests).toHaveLength(1)
+        const summaryHistory = adapter.summaryRequests[0]!.messages.slice(0, -1)
+          .filter(message => message.role !== 'system')
+        const originalHistory = adapter.conversationRequests[0]!.messages
+          .filter(message => message.role !== 'system')
+        expect(JSON.stringify(summaryHistory).length).toBeLessThan(JSON.stringify(originalHistory).length * 0.9)
         const instruction = adapter.summaryRequests[0]!.messages.at(-1)?.content
           .map(block => (block.type === 'text' ? block.text : ''))
           .join('') ?? ''

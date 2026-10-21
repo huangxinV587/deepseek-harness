@@ -155,6 +155,36 @@ export function selectCompactableRange(
 }
 
 /**
+ * Reduce the old compactable prefix before issuing an overflow summary request.
+ * Price only that prefix: a fixed system head and the required recent tail do
+ * not enlarge the summary. Whole tool units may exceed the halfway target.
+ * @param session - session supplying the balanced surface boundaries.
+ * @param measurement - current surface pricing from the conversation meter.
+ * @returns approximately half the maximal prefix, rounded to a balanced unit.
+ */
+export function selectOverflowCompactableRange(
+  session: Session,
+  measurement: TokenMeasurement,
+): { start: SessionSeq; end: SessionSeq } | null {
+  const maximal = selectCompactableRange(session, measurement, 0)
+  if (maximal === null) return null
+  const start = measurement.nodes.findIndex(node => node.seq === maximal.start)
+  const end = measurement.nodes.findIndex(node => node.seq === maximal.end)
+  const nodes = measurement.nodes.slice(start, end + 1)
+  const target = nodes.reduce((total, node) => total + node.tokens, 0) / 2
+  let accumulated = 0
+  let cutoff = maximal.end
+  for (const node of nodes) {
+    accumulated += node.tokens
+    if (accumulated >= target && toolPairingBalancedAfter(session, node.seq)) {
+      cutoff = node.seq
+      break
+    }
+  }
+  return { start: maximal.start, end: cutoff }
+}
+
+/**
  * Run the single compaction transaction over one selected positional span.
  * Selection and validation are read-only. Idle/log validation and
  * `compaction/start` are synchronously adjacent, so the durable opening marker is

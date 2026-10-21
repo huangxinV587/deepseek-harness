@@ -26,6 +26,7 @@ import {
   assertNoActiveCompaction,
   compactSurfaceRegion,
   selectCompactableRange,
+  selectOverflowCompactableRange,
 } from './region.ts'
 import { summarizeWithLlm } from './summarizer.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
@@ -296,7 +297,7 @@ export class BasicCompactionEngine extends CompactionEngine {
         prune.pruneSession(agent.session)
         measurement = meter.measure(agent.session)
       }
-      const range = selectCompactableRange(agent.session, measurement, 0)
+      const range = selectOverflowCompactableRange(agent.session, measurement)
       if (range === null) return null
       return this.compactRegion(range.start, range.end, agent, signal)
     }
