@@ -157,10 +157,10 @@ export function selectCompactableRange(
 /**
  * Reduce the old compactable prefix before issuing an overflow summary request.
  * Price only that prefix: a fixed system head and the required recent tail do
- * not enlarge the summary. Whole tool units may exceed the halfway target.
+ * not enlarge the selection target. Whole tool units may exceed that target.
  * @param session - session supplying the balanced surface boundaries.
  * @param measurement - current surface pricing from the conversation meter.
- * @returns approximately half the maximal prefix, rounded to a balanced unit.
+ * @returns approximately half the maximal prefix at a balanced unit, or null when none exists.
  */
 export function selectOverflowCompactableRange(
   session: Session,
