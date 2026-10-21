@@ -20,7 +20,7 @@ jobs:
         with:
           node-version: '24'
       - run: pnpm install --frozen-lockfile
-      - run: pnpm run build:native-system
+      - run: pnpm run build:artifacts
       - run: pnpm exec vitest run packages/compaction/compaction-basic/tests/compaction-basic.spec.ts packages/compaction/compaction-basic/tests/compaction-loop-repro.spec.ts packages/compaction/compaction-basic/tests/loader-composition.spec.ts packages/compaction/compaction-basic/tests/runtime-context-admission.spec.ts packages/compaction/compaction-basic/tests/manual-compaction.spec.ts
       - run: pnpm run test:snapshot:refresh snapshots/session/headless.snapshot.ts -t 'compaction-recovery'
       - run: pnpm run test:snapshot snapshots/session/headless.snapshot.ts -t 'compaction-recovery'
