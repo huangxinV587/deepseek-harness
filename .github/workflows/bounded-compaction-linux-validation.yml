@@ -1,0 +1,30 @@
+name: Bounded compaction Linux validation
+on:
+  push:
+    branches: [test/bounded-overflow-linux]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      DSH_GATE_CONCURRENCY: '2'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v5.0.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:native-system
+      - run: pnpm exec vitest run packages/compaction/compaction-basic/tests/compaction-basic.spec.ts packages/compaction/compaction-basic/tests/compaction-loop-repro.spec.ts packages/compaction/compaction-basic/tests/loader-composition.spec.ts packages/compaction/compaction-basic/tests/runtime-context-admission.spec.ts packages/compaction/compaction-basic/tests/manual-compaction.spec.ts
+      - run: pnpm run test:snapshot:refresh snapshots/session/headless.snapshot.ts -t 'compaction-recovery'
+      - run: pnpm run test:snapshot snapshots/session/headless.snapshot.ts -t 'compaction-recovery'
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: compaction-recovery-linux
+          path: snapshots/session/compaction-recovery/
